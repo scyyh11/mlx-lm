@@ -9,7 +9,12 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -1384,6 +1389,155 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def _deepseek_v2_args(self, **kwargs):
+        from mlx_lm.models import deepseek_v2
+
+        params = {
+            "model_type": "deepseek_v2",
+            "vocab_size": 1024,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "moe_intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "kv_lora_rank": 32,
+            "q_lora_rank": 4,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 16,
+            "qk_nope_head_dim": 32,
+            "rope_scaling": {
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 40,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 4096,
+                "type": "yarn",
+            },
+        }
+        params.update(kwargs)
+        return deepseek_v2.ModelArgs.from_dict(params)
+
+    def _deepseek_v2_quantized_kv_b_proj(self, args, bits, group_size, mode):
+        head_dim = args.qk_nope_head_dim + args.v_head_dim
+        size = args.num_attention_heads * head_dim * args.kv_lora_rank
+        weight = mx.arange(size, dtype=mx.float32).reshape(
+            args.num_attention_heads * head_dim, args.kv_lora_rank
+        )
+        weight = (weight / size) - 0.5
+        q_weight, q_scales, *q_biases = mx.quantize(
+            weight,
+            bits=bits,
+            group_size=group_size,
+            mode=mode,
+        )
+        prefix = "model.layers.0.self_attn.kv_b_proj"
+        weights = {
+            f"{prefix}.weight": q_weight,
+            f"{prefix}.scales": q_scales,
+        }
+        if q_biases:
+            weights[f"{prefix}.biases"] = q_biases[0]
+        return weights
+
+    def test_deepseek_v2_sanitize_splits_kv_b_proj(self):
+        from mlx_lm.models import deepseek_v2
+
+        args = self._deepseek_v2_args(kv_lora_rank=4)
+        model = deepseek_v2.Model(args)
+        prefix = "model.layers.0.self_attn"
+        head_dim = args.qk_nope_head_dim + args.v_head_dim
+        weight = mx.arange(
+            args.num_attention_heads * head_dim * args.kv_lora_rank,
+            dtype=mx.float32,
+        ).reshape(args.num_attention_heads * head_dim, args.kv_lora_rank)
+
+        sanitized = model.sanitize({f"{prefix}.kv_b_proj.weight": weight})
+
+        split = weight.reshape(args.num_attention_heads, head_dim, -1)
+        expected_embed_q = mx.contiguous(
+            split[:, : args.qk_nope_head_dim, :].swapaxes(-1, -2)
+        )
+        expected_unembed_out = mx.contiguous(split[:, args.qk_nope_head_dim :, :])
+        self.assertNotIn(f"{prefix}.kv_b_proj.weight", sanitized)
+        self.assertTrue(
+            mx.array_equal(sanitized[f"{prefix}.embed_q.weight"], expected_embed_q)
+        )
+        self.assertTrue(
+            mx.array_equal(
+                sanitized[f"{prefix}.unembed_out.weight"], expected_unembed_out
+            )
+        )
+
+    def test_deepseek_v2_quantized_kv_cache(self):
+        from mlx_lm.models import deepseek_v2
+
+        args = self._deepseek_v2_args(num_hidden_layers=2)
+        model = deepseek_v2.Model(args)
+
+        for inputs, next_inputs in [
+            (mx.array([[0, 1]]), mx.array([[2]])),
+            (mx.array([[0, 1], [2, 3]]), mx.array([[4], [5]])),
+        ]:
+            cache = [
+                QuantizedKVCache(group_size=32, bits=4) for _ in model.layers
+            ]
+            outputs = model(inputs, cache=cache)
+            self.assertEqual(outputs.shape, (*inputs.shape, args.vocab_size))
+            outputs = model(next_inputs, cache=cache)
+            self.assertEqual(outputs.shape, (*next_inputs.shape, args.vocab_size))
+
+    def test_deepseek_v2_sanitize_uses_legacy_mxfp4_quantization_config(self):
+        from mlx_lm.models import deepseek_v2
+
+        args = self._deepseek_v2_args(quantization_config={"quant_method": "mxfp4"})
+        model = deepseek_v2.Model(args)
+        weights = self._deepseek_v2_quantized_kv_b_proj(
+            args, bits=4, group_size=32, mode="mxfp4"
+        )
+
+        sanitized = model.sanitize(weights)
+
+        embed_q = "model.layers.0.self_attn.embed_q"
+        unembed_out = "model.layers.0.self_attn.unembed_out"
+        self.assertIn(f"{embed_q}.scales", sanitized)
+        self.assertIn(f"{unembed_out}.scales", sanitized)
+        self.assertNotIn(f"{embed_q}.biases", sanitized)
+        self.assertNotIn(f"{unembed_out}.biases", sanitized)
+
+    def test_deepseek_v2_sanitize_rewrites_kv_b_proj_quantization_override(self):
+        from mlx_lm.models import deepseek_v2
+
+        kv_b_proj = "model.layers.0.self_attn.kv_b_proj"
+        embed_q = "model.layers.0.self_attn.embed_q"
+        unembed_out = "model.layers.0.self_attn.unembed_out"
+        override = {"group_size": 32, "bits": 8, "mode": "affine"}
+        quantization = {
+            "group_size": 32,
+            "bits": 4,
+            "mode": "affine",
+            kv_b_proj: override,
+        }
+        quantization_config = copy.deepcopy(quantization)
+        args = self._deepseek_v2_args(
+            quantization=quantization,
+            quantization_config=quantization_config,
+        )
+        model = deepseek_v2.Model(args)
+        weights = self._deepseek_v2_quantized_kv_b_proj(
+            args, bits=8, group_size=32, mode="affine"
+        )
+
+        model.sanitize(weights)
+
+        self.assertNotIn(kv_b_proj, quantization)
+        self.assertEqual(quantization[embed_q], override)
+        self.assertEqual(quantization[unembed_out], override)
+        self.assertNotIn(kv_b_proj, quantization_config)
+        self.assertEqual(quantization_config[embed_q], override)
+        self.assertEqual(quantization_config[unembed_out], override)
 
     def test_deepseek_v3(self):
         from mlx_lm.models import deepseek_v3

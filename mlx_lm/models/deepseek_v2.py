@@ -10,6 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
@@ -43,6 +44,8 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    quantization: Optional[Dict[str, Any]] = None
+    quantization_config: Optional[Dict[str, Any]] = None
 
 
 def yarn_find_correction_dim(
@@ -162,11 +165,11 @@ class DeepseekV2Attention(nn.Module):
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads
-            * (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
-            bias=False,
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
+        )
+        self.unembed_out = MultiLinear(
+            self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
 
         self.o_proj = nn.Linear(
@@ -218,29 +221,58 @@ class DeepseekV2Attention(nn.Module):
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-        kv = kv.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
 
-        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+        offset = cache.offset if cache is not None else 0
+        q_pe = self.rope(q_pe, offset)
+        k_pe = self.rope(k_pe, offset)
+
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
 
         if cache is not None:
-            q_pe = self.rope(q_pe, cache.offset)
-            k_pe = self.rope(k_pe, cache.offset)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys, values = cache.update_and_fetch(
-                mx.concatenate([k_nope, k_pe], axis=-1), values
-            )
-        else:
-            q_pe = self.rope(q_pe)
-            k_pe = self.rope(k_pe)
-            k_pe = mx.repeat(k_pe, self.num_heads, axis=1)
-            keys = mx.concatenate([k_nope, k_pe], axis=-1)
+            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
+            if hasattr(cache, "bits"):
+                # The rotary part is combined with dense scores below. Batched
+                # or prefill quantized-cache paths use dense SDPA to avoid a
+                # 5-D GQA score layout broadcast against the 4-D PE scores.
+                k_pe = mx.dequantize(
+                    *k_pe, group_size=cache.group_size, bits=cache.bits
+                )
+                if L != 1 or B != 1:
+                    kv_latent = mx.dequantize(
+                        *kv_latent, group_size=cache.group_size, bits=cache.bits
+                    )
 
-        queries = mx.concatenate([q_nope, q_pe], axis=-1)
+        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+
+        if L == 1:
+            q_nope = self.embed_q(q_nope)
+            keys = values = kv_latent
+        else:
+            keys = self.embed_q(kv_latent, transpose=False)
+            values = self.unembed_out(kv_latent)
 
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            q_nope,
+            keys,
+            values,
+            cache=(
+                cache
+                if (not hasattr(cache, "bits") or (L == 1 and B == 1))
+                else None
+            ),
+            scale=self.scale,
+            mask=pe_scores,
         )
+        if L == 1:
+            output = self.unembed_out(output)
+
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
@@ -389,7 +421,7 @@ class DeepseekV2Model(PipelineMixin, nn.Module):
 
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(h, cache[0], return_array=True)
 
         # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:
@@ -427,6 +459,49 @@ class Model(nn.Module):
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
+    def _legacy_quantization_config(self):
+        quantization_config = self.args.quantization_config
+        if not isinstance(quantization_config, dict):
+            return None
+
+        quant_method = quantization_config.get("quant_method")
+        if quant_method == "mxfp4":
+            return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+        if quant_method == "compressed-tensors":
+            return {"group_size": 32, "bits": 4, "mode": "affine"}
+        return None
+
+    def _quantization_config_for(self, path):
+        quantization = self.args.quantization or self._legacy_quantization_config()
+        if not isinstance(quantization, dict):
+            return {}
+
+        config = {
+            k: quantization[k]
+            for k in ("group_size", "bits", "mode")
+            if k in quantization
+        }
+        override = quantization.get(path)
+        if isinstance(override, dict):
+            config.update(override)
+        return config
+
+    def _rewrite_split_quantization_config(self, path, split_paths, config):
+        for quantization in (self.args.quantization, self.args.quantization_config):
+            if not isinstance(quantization, dict) or path not in quantization:
+                continue
+
+            override = quantization.pop(path)
+            if isinstance(override, dict):
+                override = dict(override)
+                for k in ("group_size", "bits", "mode"):
+                    override.setdefault(k, config[k])
+
+            for split_path in split_paths:
+                quantization[split_path] = (
+                    dict(override) if isinstance(override, dict) else override
+                )
+
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
@@ -438,10 +513,63 @@ class Model(nn.Module):
                             for e in range(self.args.n_routed_experts)
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+            prefix = f"model.layers.{l}.self_attn"
+            kv_b_proj = f"{prefix}.kv_b_proj"
+            embed_q = f"{prefix}.embed_q"
+            unembed_out = f"{prefix}.unembed_out"
+            if f"{kv_b_proj}.weight" in weights:
+                quantized = f"{kv_b_proj}.scales" in weights
+                v = weights.pop(f"{kv_b_proj}.weight")
+                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+
+                if quantized:
+                    quantization_config = self._quantization_config_for(kv_b_proj)
+                    mode = quantization_config.get("mode", "affine")
+                    dims = self.args.kv_lora_rank
+                    scales = weights.pop(f"{kv_b_proj}.scales")
+                    biases = weights.pop(f"{kv_b_proj}.biases", None)
+                    bits = quantization_config.get("bits", (v.shape[-1] * 32) // dims)
+                    group_size = quantization_config.get(
+                        "group_size", dims // scales.shape[-1]
+                    )
+                    v = mx.dequantize(
+                        v,
+                        scales,
+                        biases,
+                        bits=bits,
+                        group_size=group_size,
+                        mode=mode,
+                    )
+                num_heads = self.args.num_attention_heads
+                v = v.reshape(num_heads, head_dim, -1)
+                wk = mx.contiguous(
+                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+                )
+                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
+                if quantized:
+                    wk_q = mx.quantize(wk, bits=bits, group_size=group_size, mode=mode)
+                    wv_q = mx.quantize(wv, bits=bits, group_size=group_size, mode=mode)
+                    weights[f"{embed_q}.weight"] = wk_q[0]
+                    weights[f"{unembed_out}.weight"] = wv_q[0]
+                    weights[f"{embed_q}.scales"] = wk_q[1]
+                    weights[f"{unembed_out}.scales"] = wv_q[1]
+                    if len(wk_q) > 2:
+                        weights[f"{embed_q}.biases"] = wk_q[2]
+                    if len(wv_q) > 2:
+                        weights[f"{unembed_out}.biases"] = wv_q[2]
+                    self._rewrite_split_quantization_config(
+                        kv_b_proj,
+                        (embed_q, unembed_out),
+                        {"group_size": group_size, "bits": bits, "mode": mode},
+                    )
+                else:
+                    weights[f"{embed_q}.weight"] = wk
+                    weights[f"{unembed_out}.weight"] = wv
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
+        rank = group.rank()
         N = group.size()
         for layer in self.model.layers:
             # Shard the self attention
@@ -453,13 +581,20 @@ class Model(nn.Module):
                 layer.self_attn.q_b_proj = shard_linear(
                     layer.self_attn.q_b_proj, "all-to-sharded", group=group
                 )
-            layer.self_attn.kv_b_proj = shard_linear(
-                layer.self_attn.kv_b_proj, "all-to-sharded", group=group
-            )
+            layer.self_attn.num_heads //= N
+            num_heads = layer.self_attn.num_heads
+            sh = rank * num_heads
+            eh = sh + num_heads
+
+            def shard_heads(w):
+                return w[sh:eh]
+
+            layer.self_attn.embed_q.apply(shard_heads)
+            layer.self_attn.unembed_out.apply(shard_heads)
+
             layer.self_attn.o_proj = shard_linear(
                 layer.self_attn.o_proj, "sharded-to-all", group=group
             )
-            layer.self_attn.num_heads //= N
 
             # Shard the MLP
             if isinstance(layer.mlp, DeepseekV2MLP):

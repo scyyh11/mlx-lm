@@ -385,6 +385,8 @@ def load_model(
         elif quant_method in ("awq", "gptq"):
             # Transform AutoAWQ/GPTQ packed weights to MLX format
             weights, quantization = _transform_awq_weights(weights, quantization_config)
+            if hasattr(model, "sanitize"):
+                weights = model.sanitize(weights)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)

@@ -91,17 +91,13 @@ gemma3_awq = update(gemma3_text_awq, lm_key="language_model")
 deepseek_v2_awq = AWQConfig(
     embed="embed_tokens",
     lm_head="lm_head",
-    no_clip=["q_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"],
+    no_clip=["q_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa"],
     scale_configs=[
         ScaleConfig(
             block="self_attn",
             prev="input_layernorm",
             layers=["q_proj", "kv_a_proj_with_mqa"],
             kwargs=["mask"],
-        ),
-        ScaleConfig(
-            prev="self_attn.kv_a_layernorm",
-            layers=["self_attn.kv_b_proj"],
         ),
         ScaleConfig(
             prev="mlp.up_proj",
@@ -415,7 +411,8 @@ def awq_quantize(
         wq = mx.quantize(w, bits=bits, group_size=group_size)
         return mx.dequantize(*wq, bits=bits, group_size=group_size)
 
-    mask = create_attention_mask(inputs)
+    # Absorbed MLA models fold the causal mask into dense PE scores.
+    mask = create_attention_mask(inputs, return_array=True)
 
     embed_key = awq_config.embed
     model.model[embed_key] = model.model[embed_key].to_quantized(
